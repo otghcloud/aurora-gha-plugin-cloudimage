@@ -74,5 +74,3 @@ docs: Update initial documentation
 Following the conventions above helps keep our codebase tidy and readable.
 
 Our release workflow depends on structured commit/pull request titles for accurately producing version numbers and release notes.
-
-[core]: https://github.com/otghcloud/aurora-gha-manager
