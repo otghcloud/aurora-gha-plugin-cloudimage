@@ -32,7 +32,7 @@ Individual commit messages within a PR follow the same prefix convention and for
 
 ## Issues
 
-You can submit issues or enhancement requests [by visiting our issues page](https://github.com/otghcloud/aurora-gha-manager-pro/issues).
+You can submit issues or enhancement requests [by visiting our issues page](https://github.com/otghcloud/aurora-gha-plugin-cloudimage/issues).
 
 ## Pull Request Titles
 
@@ -74,5 +74,3 @@ docs: Update initial documentation
 Following the conventions above helps keep our codebase tidy and readable.
 
 Our release workflow depends on structured commit/pull request titles for accurately producing version numbers and release notes.
-
-[core]: https://github.com/otghcloud/aurora-gha-manager

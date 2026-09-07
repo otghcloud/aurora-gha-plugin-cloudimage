@@ -1,0 +1,8 @@
+{
+  "ignorePatterns": [
+    {
+      "pattern": "^https://github.com/otghcloud/aurora-gha-plugin-cloudimage"
+    }
+  ],
+  "replacementPatterns": []
+}
