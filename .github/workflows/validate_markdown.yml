@@ -1,0 +1,19 @@
+name: Validate Markdown
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  markdown:
+    runs-on: ['self-hosted', 'ubuntu-latest']
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Lint Markdown
+        uses: DavidAnson/markdownlint-cli2-action@v24.2.0
+        with:
+          globs: '**/*.md'

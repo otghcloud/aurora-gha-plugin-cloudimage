@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_override:
+        description: Semantic version bump when version_override is empty
+        required: true
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+      version_override:
+        description: Optional explicit version without the v prefix; defaults to 1.0.0 for the first release
+        required: false
+        default: ''
+        type: string
+      release_title:
+        description: Title for the GitHub release
+        required: true
+        type: string
+
+concurrency:
+  group: release-aurora-gha-plugin-cloudimage
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ['self-hosted', 'ubuntu-latest']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Calculate version
+        id: version
+        env:
+          BUMP_OVERRIDE: ${{ inputs.bump_override }}
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${VERSION_OVERRIDE}" ]]; then
+            version="${VERSION_OVERRIDE#v}"
+          else
+            last_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1)"
+            if [[ -z "${last_tag}" ]]; then
+              version="1.0.0"
+            else
+            IFS=. read -r major minor patch <<< "${last_tag#v}"
+            case "${BUMP_OVERRIDE}" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch|auto) patch=$((patch + 1)) ;;
+              *) echo "Unsupported bump: ${BUMP_OVERRIDE}" >&2; exit 1 ;;
+            esac
+            version="${major}.${minor}.${patch}"
+            fi
+          fi
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: ${version}" >&2; exit 1; }
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+      - name: Validate Composer package
+        run: composer validate --strict --no-check-publish
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+        run: |
+          set -euo pipefail
+          git tag -a "${TAG}" -m "${TAG} - ${RELEASE_TITLE}"
+          git push origin "${TAG}"
+          gh release create "${TAG}" --generate-notes --title "${RELEASE_TITLE}"
+      - name: Notify Packagist
+        env:
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+          PACKAGIST_USERNAME: otghcloud
+          PACKAGIST_VCS_URL: https://github.com/otghcloud/aurora-gha-plugin-cloudimage
+        run: |
+          set -euo pipefail
+          [[ -n "${PACKAGIST_TOKEN}" ]] || { echo 'PACKAGIST_TOKEN is required' >&2; exit 1; }
+          curl --fail-with-body --silent --show-error --request POST \
+            --data-urlencode "username=${PACKAGIST_USERNAME}" \
+            --data-urlencode "apiToken=${PACKAGIST_TOKEN}" \
+            --data-urlencode "repository=${PACKAGIST_VCS_URL}" \
+            https://packagist.org/api/update-package

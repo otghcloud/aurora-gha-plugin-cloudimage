@@ -1,0 +1,22 @@
+name: Validate PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ['self-hosted', 'ubuntu-latest']
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Check title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(fix|feat|ci|docs|style|build|refactor|perf|test|chore|revert)(\([a-z0-9._/-]+\))?(!)?: [A-Z].*[^.]$'
+          grep -qP "$pattern" <<< "$PR_TITLE"
