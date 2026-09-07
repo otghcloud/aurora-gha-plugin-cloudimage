@@ -32,7 +32,7 @@ Individual commit messages within a PR follow the same prefix convention and for
 
 ## Issues
 
-You can submit issues or enhancement requests [by visiting our issues page](https://github.com/otghcloud/aurora-gha-manager-pro/issues).
+You can submit issues or enhancement requests [by visiting our issues page](https://github.com/otghcloud/aurora-gha-plugin-cloudimage/issues).
 
 ## Pull Request Titles
 
