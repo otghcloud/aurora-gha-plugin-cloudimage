@@ -90,8 +90,26 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "${PACKAGIST_TOKEN}" ]] || { echo 'PACKAGIST_TOKEN is required' >&2; exit 1; }
-          curl --fail-with-body --silent --show-error --request POST \
-            --data-urlencode "username=${PACKAGIST_USERNAME}" \
-            --data-urlencode "apiToken=${PACKAGIST_TOKEN}" \
-            --data-urlencode "repository=${PACKAGIST_VCS_URL}" \
-            https://packagist.org/api/update-package
+          payload="{\"repository\":{\"url\":\"${PACKAGIST_VCS_URL}\"}}"
+          response_file="$(mktemp)"
+          trap 'rm -f "${response_file}"' EXIT
+          http_code="$(curl --silent --output "${response_file}" --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --url "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+            --data "${payload}")"
+          if [[ "${http_code}" == '200' || "${http_code}" == '202' ]]; then
+            exit 0
+          fi
+          if grep -Eqi 'not[ -]?found|does not exist|unknown package' "${response_file}"; then
+            http_code="$(curl --silent --output "${response_file}" --write-out '%{http_code}' \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --url "https://packagist.org/api/create-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+              --data "${payload}")"
+            if [[ "${http_code}" == '200' || "${http_code}" == '201' || "${http_code}" == '202' ]]; then
+              exit 0
+            fi
+          fi
+          cat "${response_file}" >&2
+          exit 1
