@@ -8,15 +8,21 @@ use App\Exceptions\ProvisioningException;
 use App\Models\Builds\ImageBuild;
 use App\Models\Credentials\BuildCredential;
 use App\Models\Credentials\Credential;
+use App\Services\Builds\GuestBuildCallbackService;
 use App\Services\Builds\RunnerImagesLocator;
 use App\Services\Builds\TemplateCatalog;
 use App\Services\Builds\TemplateCatalogEntry;
 use App\Services\Proxmox\ProxmoxClient;
+use App\Services\SettingsRepository;
 use App\Services\Ssh\SshConnection;
 
 final class CloudImageBuilder implements BuilderInterface
 {
     private const GUEST_IP_TIMEOUT_SECONDS = 300;
+
+    private const GUEST_BUILD_TIMEOUT_SECONDS = 43200;
+
+    private const GUEST_POLL_SECONDS = 2;
 
     public function __construct(
         private readonly RunnerImagesLocator $runnerImages = new RunnerImagesLocator,
@@ -92,7 +98,8 @@ final class CloudImageBuilder implements BuilderInterface
             $proxmox->start($vmid);
 
             $ip = $this->awaitGuestIp($proxmox, $vmid);
-            $this->runManifestCommands($build, $entry, $templateDirectory, $ip, $credential);
+            $this->runGuestBundle($build, $entry, $templateDirectory, $ip, $credential);
+            $build->forceFill(['guest_finalizing_at' => now()])->save();
             // A hard stop() cuts power before buffered writes reach disk, which previously baked
             // zero-byte files (the actions-runner tarball's own contents included) into the
             // sealed template - see ProxmoxClient::shutdown() for the full explanation.
@@ -101,7 +108,9 @@ final class CloudImageBuilder implements BuilderInterface
 
             return new BuildResult(true, 0, $vmid);
         } catch (\Throwable $exception) {
-            if ($created) {
+            $keepFailedVm = $build->keep_failed_vm || app(SettingsRepository::class)->keepFailedBuildVm();
+
+            if ($created && ! $keepFailedVm) {
                 try {
                     $proxmox->destroy($vmid);
                 } catch (\Throwable) {
@@ -128,6 +137,153 @@ final class CloudImageBuilder implements BuilderInterface
         }
 
         throw new ProvisioningException("Cloud image VM {$vmid} never reported an IPv4 address.");
+    }
+
+    private function runGuestBundle(
+        ImageBuild $build,
+        TemplateCatalogEntry $entry,
+        string $templateDirectory,
+        string $ip,
+        Credential|BuildCredential $credential,
+    ): void {
+        $manifest = $this->resolvedManifest($build, $templateDirectory);
+        $credentials = app(GuestBuildCallbackService::class)->issueCredentials($build);
+        $remoteDirectory = GuestBuildPath::forBuild($build, $credential);
+        $bundle = GuestBuildBundle::prepare(
+            $entry,
+            $templateDirectory,
+            $manifest,
+            [
+                'callback_url' => $credentials['url'].'/api/builds/'.$build->id.'/events',
+                'callback_token' => $credentials['token'],
+                'environment' => $this->buildEnvironment($build),
+            ],
+            $this->runnerImages,
+            $this->catalog,
+        );
+
+        $ssh = new SshConnection(
+            host: $ip,
+            port: 22,
+            username: (string) $credential->resolvedUsername(),
+            privateKey: $credential->private_key,
+            timeout: 300,
+        );
+
+        try {
+            $remoteArchive = $remoteDirectory.'.tar.gz';
+            $ssh->putFile($remoteArchive, $bundle->archive);
+            $ssh->run(sprintf(
+                'rm -rf %1$s; mkdir -p %1$s; tar -xzf %2$s -C %1$s; nohup env GHA_BUILD_BUNDLE_DIR=%1$s python3 %1$s/guest-runner.py </dev/null >/dev/null 2>&1 &',
+                escapeshellarg($remoteDirectory),
+                escapeshellarg($remoteArchive),
+            ));
+            $this->awaitGuestResult($build, $ssh, $remoteDirectory);
+            $ssh->run('rm -rf '.escapeshellarg($remoteDirectory).' '.escapeshellarg($remoteArchive));
+        } finally {
+            $ssh->disconnect();
+            $bundle->delete();
+        }
+    }
+
+    /** @return array<string, mixed> */
+    private function resolvedManifest(ImageBuild $build, string $templateDirectory): array
+    {
+        $path = rtrim($templateDirectory, '/').'/build.json';
+        $manifest = json_decode((string) file_get_contents($path), true);
+
+        if (! is_array($manifest)) {
+            throw new ProvisioningException('The cloud image build manifest is invalid.');
+        }
+
+        foreach ($manifest['stage_groups'] ?? [] as &$group) {
+            foreach ($group['stages'] ?? [] as &$stage) {
+                if (is_array($stage['environment'] ?? null)) {
+                    $stage['environment'] = $this->stageEnvironment($build, $stage['environment']);
+                }
+            }
+        }
+        unset($group, $stage);
+
+        return $manifest;
+    }
+
+    /** @return array<string, string> */
+    private function buildEnvironment(ImageBuild $build): array
+    {
+        $account = $build->environment?->githubAccount;
+        $githubToken = (string) ($account?->github_token ?? '');
+
+        return [
+            // The generated configure stage consumes GH_API_TOKEN, while the
+            // bundled curl wrapper reads GITHUB_TOKEN directly.
+            'GH_API_TOKEN' => $githubToken,
+            'GITHUB_TOKEN' => $githubToken,
+            'GH_API_MIN_REMAINING' => (string) config('builds.github_api_min_remaining', 1000),
+            'GH_API_WAIT_BUFFER_SECONDS' => (string) config('builds.github_api_wait_buffer_seconds', 30),
+        ];
+    }
+
+    private function awaitGuestResult(ImageBuild $build, SshConnection $ssh, string $remoteDirectory): void
+    {
+        $deadline = microtime(true) + self::GUEST_BUILD_TIMEOUT_SECONDS;
+        $logOffset = 0;
+
+        while (microtime(true) < $deadline) {
+            $build->refresh();
+
+            if ($build->status->isFinished()) {
+                throw new ProvisioningException('Cloud image guest build finished without success.');
+            }
+
+            if ($build->guest_outcome !== null) {
+                if ($build->guest_outcome === 'succeeded') {
+                    return;
+                }
+
+                throw new ProvisioningException($build->guest_error ?: 'Cloud image guest build failed.');
+            }
+
+            try {
+                $logOffset = $this->reconcileGuestLog($build, $ssh, $remoteDirectory, $logOffset);
+                $result = trim($ssh->run('cat '.escapeshellarg($remoteDirectory.'/result.json').' 2>/dev/null || true'));
+                $decoded = json_decode($result, true);
+
+                if (is_array($decoded) && isset($decoded['outcome'])) {
+                    if ($decoded['outcome'] === 'succeeded') {
+                        return;
+                    }
+
+                    throw new ProvisioningException((string) ($decoded['error'] ?? 'Cloud image guest build failed.'));
+                }
+            } catch (\RuntimeException|\ErrorException) {
+                // Callback delivery remains primary; a temporary SSH loss is reconciled next poll.
+            }
+
+            sleep(self::GUEST_POLL_SECONDS);
+        }
+
+        throw new ProvisioningException('Timed out waiting for the Cloud Image guest build result.');
+    }
+
+    private function reconcileGuestLog(ImageBuild $build, SshConnection $ssh, string $remoteDirectory, int $offset): int
+    {
+        if ($build->log_path === null) {
+            return $offset;
+        }
+
+        $encoded = trim($ssh->run(
+            'tail -c +'.($offset + 1).' '.escapeshellarg($remoteDirectory.'/build.log').' 2>/dev/null | base64 -w 0'
+        ));
+        $contents = base64_decode($encoded, true);
+
+        if ($contents === false || $contents === '') {
+            return $offset;
+        }
+
+        file_put_contents($build->log_path, $contents, FILE_APPEND);
+
+        return $offset + strlen($contents);
     }
 
     private function runManifestCommands(
