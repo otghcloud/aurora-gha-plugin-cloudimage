@@ -31,10 +31,10 @@ final class GuestBuildBundle
         $directory = sys_get_temp_dir().'/gha-build-'.bin2hex(random_bytes(12));
         $archive = $directory.'.tar.gz';
         $runnerRoot = $runnerImages->filesystemRoot($entry);
-        $runner = rtrim($templateDirectory, '/').'/guest-runner.py';
+        $runner = $catalog->root().'/guest-agents/cloudimage-guest-runner.py';
 
         if ($runnerRoot === null || ! is_file($runner)) {
-            throw new ProvisioningException('The installed Cloud Image template does not contain the guest runner assets.');
+            throw new ProvisioningException('The installed templates bundle does not contain the Cloud Image guest runner.');
         }
 
         File::ensureDirectoryExists($directory);
