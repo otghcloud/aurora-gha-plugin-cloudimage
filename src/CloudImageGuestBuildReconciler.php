@@ -91,7 +91,7 @@ final class CloudImageGuestBuildReconciler
         return true;
     }
 
-    private function claimFinalization(ImageBuild $build): bool
+    public function claimFinalization(ImageBuild $build): bool
     {
         $staleBefore = now()->subSeconds(self::FINALIZATION_LEASE_SECONDS);
 

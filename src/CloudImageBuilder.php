@@ -4,6 +4,7 @@ namespace OTGH\GHARM\CloudImage;
 
 use App\Contracts\Builds\BuilderInterface;
 use App\Contracts\Builds\BuildResult;
+use App\Enums\BuildStatus;
 use App\Exceptions\ProvisioningException;
 use App\Models\Builds\ImageBuild;
 use App\Models\Credentials\BuildCredential;
@@ -15,6 +16,7 @@ use App\Services\Builds\TemplateCatalogEntry;
 use App\Services\Proxmox\ProxmoxClient;
 use App\Services\SettingsRepository;
 use App\Services\Ssh\SshConnection;
+use Illuminate\Support\Facades\Log;
 
 final class CloudImageBuilder implements BuilderInterface
 {
@@ -98,8 +100,9 @@ final class CloudImageBuilder implements BuilderInterface
             $proxmox->start($vmid);
 
             $ip = $this->awaitGuestIp($proxmox, $vmid);
-            $this->runGuestBundle($build, $entry, $templateDirectory, $ip, $credential);
-            $build->forceFill(['guest_finalizing_at' => now()])->save();
+            if (! $this->runGuestBundle($build, $entry, $templateDirectory, $ip, $credential)) {
+                return new BuildResult(true, 0, $vmid);
+            }
             // A hard stop() cuts power before buffered writes reach disk, which previously baked
             // zero-byte files (the actions-runner tarball's own contents included) into the
             // sealed template - see ProxmoxClient::shutdown() for the full explanation.
@@ -108,6 +111,16 @@ final class CloudImageBuilder implements BuilderInterface
 
             return new BuildResult(true, 0, $vmid);
         } catch (\Throwable $exception) {
+            // Reconciliation may have completed while this worker was blocked on SSH.
+            if ($build->fresh()?->status === BuildStatus::Succeeded) {
+                Log::warning('Cloud Image worker errored after the build was already completed', [
+                    'build' => $build->id,
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return new BuildResult(true, 0, $vmid);
+            }
+
             $keepFailedVm = $build->keep_failed_vm || app(SettingsRepository::class)->keepFailedBuildVm();
 
             if ($created && ! $keepFailedVm) {
@@ -145,7 +158,7 @@ final class CloudImageBuilder implements BuilderInterface
         string $templateDirectory,
         string $ip,
         Credential|BuildCredential $credential,
-    ): void {
+    ): bool {
         $manifest = $this->resolvedManifest($build, $templateDirectory);
         $credentials = app(GuestBuildCallbackService::class)->issueCredentials($build);
         $remoteDirectory = GuestBuildPath::forBuild($build, $credential);
@@ -178,8 +191,13 @@ final class CloudImageBuilder implements BuilderInterface
                 escapeshellarg($remoteDirectory),
                 escapeshellarg($remoteArchive),
             ));
-            $this->awaitGuestResult($build, $ssh, $remoteDirectory);
+            if (! $this->awaitGuestResult($build, $ssh, $remoteDirectory)) {
+                return false;
+            }
+
             $ssh->run('rm -rf '.escapeshellarg($remoteDirectory).' '.escapeshellarg($remoteArchive));
+
+            return true;
         } finally {
             $ssh->disconnect();
             $bundle->delete();
@@ -224,7 +242,8 @@ final class CloudImageBuilder implements BuilderInterface
         ];
     }
 
-    private function awaitGuestResult(ImageBuild $build, SshConnection $ssh, string $remoteDirectory): void
+    /** Returns whether this worker owns finalization, rather than a reconciler having completed it. */
+    private function awaitGuestResult(ImageBuild $build, SshConnection $ssh, string $remoteDirectory): bool
     {
         $deadline = microtime(true) + self::GUEST_BUILD_TIMEOUT_SECONDS;
         $logOffset = 0;
@@ -232,13 +251,24 @@ final class CloudImageBuilder implements BuilderInterface
         while (microtime(true) < $deadline) {
             $build->refresh();
 
+            if ($build->status === BuildStatus::Succeeded) {
+                return false;
+            }
+
             if ($build->status->isFinished()) {
                 throw new ProvisioningException('Cloud image guest build finished without success.');
             }
 
             if ($build->guest_outcome !== null) {
                 if ($build->guest_outcome === 'succeeded') {
-                    return;
+                    if (app(CloudImageGuestBuildReconciler::class)->claimFinalization($build)) {
+                        return true;
+                    }
+
+                    // Another worker owns shutdown and conversion; do not touch its guest.
+                    sleep(self::GUEST_POLL_SECONDS);
+
+                    continue;
                 }
 
                 throw new ProvisioningException($build->guest_error ?: 'Cloud image guest build failed.');
@@ -247,17 +277,27 @@ final class CloudImageBuilder implements BuilderInterface
             try {
                 $logOffset = $this->reconcileGuestLog($build, $ssh, $remoteDirectory, $logOffset);
                 $result = trim($ssh->run('cat '.escapeshellarg($remoteDirectory.'/result.json').' 2>/dev/null || true'));
-                $decoded = json_decode($result, true);
-
-                if (is_array($decoded) && isset($decoded['outcome'])) {
-                    if ($decoded['outcome'] === 'succeeded') {
-                        return;
-                    }
-
-                    throw new ProvisioningException((string) ($decoded['error'] ?? 'Cloud image guest build failed.'));
-                }
             } catch (\RuntimeException|\ErrorException) {
                 // Callback delivery remains primary; a temporary SSH loss is reconciled next poll.
+                sleep(self::GUEST_POLL_SECONDS);
+
+                continue;
+            }
+
+            $decoded = json_decode($result, true);
+
+            if (is_array($decoded) && isset($decoded['outcome'])) {
+                if ($decoded['outcome'] !== 'succeeded') {
+                    throw new ProvisioningException((string) ($decoded['error'] ?? 'Cloud image guest build failed.'));
+                }
+
+                $build->forceFill([
+                    'guest_outcome' => 'succeeded',
+                    'guest_exit_code' => $decoded['exit_code'] ?? 0,
+                    'guest_error' => null,
+                ])->save();
+
+                continue;
             }
 
             sleep(self::GUEST_POLL_SECONDS);
