@@ -105,7 +105,7 @@ final class CloudImageBuilder implements BuilderInterface
             }
             // A hard stop() cuts power before buffered writes reach disk, which previously baked
             // zero-byte files (the actions-runner tarball's own contents included) into the
-            // sealed template - see ProxmoxClient::shutdown() for the full explanation.
+            // sealed template.
             $proxmox->shutdown($vmid);
             $proxmox->convertToTemplate($vmid);
 
