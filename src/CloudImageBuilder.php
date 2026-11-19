@@ -5,6 +5,7 @@ namespace OTGH\GHARM\CloudImage;
 use App\Contracts\Builds\BuilderInterface;
 use App\Contracts\Builds\BuildResult;
 use App\Enums\BuildStatus;
+use App\Enums\PoolOs;
 use App\Exceptions\ProvisioningException;
 use App\Models\Builds\ImageBuild;
 use App\Models\Credentials\BuildCredential;
@@ -169,7 +170,7 @@ final class CloudImageBuilder implements BuilderInterface
             [
                 'callback_url' => $credentials['url'].'/api/builds/'.$build->id.'/events',
                 'callback_token' => $credentials['token'],
-                'environment' => $this->buildEnvironment($build),
+                'environment' => $this->buildEnvironment($build, $entry),
             ],
             $this->runnerImages,
             $this->catalog,
@@ -227,7 +228,7 @@ final class CloudImageBuilder implements BuilderInterface
     }
 
     /** @return array<string, string> */
-    private function buildEnvironment(ImageBuild $build): array
+    private function buildEnvironment(ImageBuild $build, TemplateCatalogEntry $entry): array
     {
         $account = $build->environment?->githubAccount;
         $githubToken = (string) ($account?->github_token ?? '');
@@ -239,6 +240,7 @@ final class CloudImageBuilder implements BuilderInterface
             'GITHUB_TOKEN' => $githubToken,
             'GH_API_MIN_REMAINING' => (string) config('builds.github_api_min_remaining', 1000),
             'GH_API_WAIT_BUFFER_SECONDS' => (string) config('builds.github_api_wait_buffer_seconds', 30),
+            'RUNNER_DIRECTORY' => $entry->runnerDirectory() ?? PoolOs::Linux->defaultRunnerDir(),
         ];
     }
 
@@ -326,210 +328,7 @@ final class CloudImageBuilder implements BuilderInterface
         return $offset + strlen($contents);
     }
 
-    private function runManifestCommands(
-        ImageBuild $build,
-        TemplateCatalogEntry $entry,
-        string $templateDirectory,
-        string $ip,
-        Credential|BuildCredential $credential,
-    ): void {
-        $manifestPath = rtrim($templateDirectory, '/').'/build.json';
-
-        if (! is_readable($manifestPath)) {
-            return;
-        }
-
-        $manifest = json_decode((string) file_get_contents($manifestPath), true);
-
-        if (! is_array($manifest)) {
-            throw new ProvisioningException('The cloud image build manifest is invalid.');
-        }
-
-        $ssh = new SshConnection(
-            host: $ip,
-            port: 22,
-            username: (string) $credential->resolvedUsername(),
-            password: null,
-            privateKey: $credential->private_key,
-            // Build stages can go quiet for a while (e.g. a silent package download); phpseclib's
-            // timeout is inactivity-based, not a hard cap, but a low value makes that more likely.
-            timeout: 300,
-        );
-
-        try {
-            foreach ($manifest['stage_groups'] ?? [] as $group) {
-                foreach ($group['stages'] ?? [] as $stage) {
-                    // Written unconditionally so upload-only stages (no `script`) still mark
-                    // themselves seen; BuildProgress scans the log for these markers, not uploads.
-                    file_put_contents((string) $build->log_path, ($stage['marker'] ?? '')."\n", FILE_APPEND);
-
-                    $this->uploadStageFiles($ssh, $entry, $templateDirectory, $stage);
-                    $this->runStageScript($ssh, $build, $templateDirectory, $stage);
-                }
-            }
-
-            // Belt and braces alongside the graceful shutdown in build(): ext4's delayed
-            // allocation can leave a just-written file's data sitting in page cache for tens of
-            // seconds, so force it to disk before the guest is asked to power off.
-            $ssh->run('sync');
-        } finally {
-            $ssh->disconnect();
-        }
-    }
-
-    /**
-     * Each stage's work is a real bash script on disk (`stage-scripts/<id>.sh`), uploaded and run
-     * as a single SSH command - not a JSON array of ad-hoc command strings. That avoids needing to
-     * double-escape shell syntax through JSON, lets a stage `export` its own env vars normally
-     * instead of repeating them on every line, and opens far fewer SSH channels per build (each of
-     * which is a chance for phpseclib's channel bookkeeping to get confused on a long build).
-     *
-     * @param  array<string, mixed>  $stage
-     */
-    private function runStageScript(SshConnection $ssh, ImageBuild $build, string $templateDirectory, array $stage): void
-    {
-        $script = $stage['script'] ?? null;
-
-        if (! is_string($script) || $script === '') {
-            return;
-        }
-
-        if ($script === '' || str_contains($script, '..')) {
-            throw new ProvisioningException('Cloud image manifest contains an invalid script path.');
-        }
-
-        $localPath = rtrim($templateDirectory, '/').'/'.ltrim($script, '/');
-
-        if (! is_readable($localPath)) {
-            throw new ProvisioningException('Cloud image stage script does not exist: '.$localPath);
-        }
-
-        $remotePath = '/tmp/gha-stage-'.($stage['id'] ?? 'unknown').'.sh';
-        $statusPath = $remotePath.'.status';
-        $ssh->putFile($remotePath, $localPath)->chmod(0755, $remotePath);
-
-        $environment = $this->stageEnvironment($build, $stage['environment'] ?? []);
-        // `</dev/null` so a script that unexpectedly hits an interactive prompt (e.g. apt asking
-        // "Do you want to continue?") fails fast on EOF instead of hanging the build forever - our
-        // exec channel has no stdin to answer it, and a PTY-less SSH exec doesn't supply one.
-        $inner = $environment === []
-            ? 'bash '.escapeshellarg($remotePath)
-            : 'export '.$this->exportEnvironment($environment).'; bash '.escapeshellarg($remotePath);
-
-        // The script's real exit code is recorded on the guest rather than trusted from the SSH
-        // channel: a package upgrade that restarts services can kill our session mid-stage, and
-        // that surfaces as a clean exit status 0 even though the script never finished.
-        $command = sprintf(
-            'rm -f %s; { %s; } </dev/null; echo $? > %s',
-            escapeshellarg($statusPath),
-            $inner,
-            escapeshellarg($statusPath)
-        );
-
-        $logPath = (string) $build->log_path;
-        // Streamed rather than buffered, so the log reflects progress as the script runs instead
-        // of appearing all at once when it finally exits.
-        $ssh->run($command, function (string $chunk) use ($logPath): void {
-            file_put_contents($logPath, $chunk, FILE_APPEND);
-        });
-
-        $this->assertStageSucceeded($ssh, $statusPath, (string) ($stage['id'] ?? 'unknown'));
-    }
-
-    /**
-     * Read back the exit code the stage script recorded on the guest.
-     *
-     * A missing status file means the remote shell died before the script finished, which the
-     * SSH channel on its own reports as success.
-     */
-    private function assertStageSucceeded(SshConnection $ssh, string $statusPath, string $stageId): void
-    {
-        $status = trim($ssh->run('cat '.escapeshellarg($statusPath).' 2>/dev/null || true'));
-
-        if ($status === '') {
-            throw new ProvisioningException(
-                'Cloud image stage did not run to completion: '.$stageId.'. The remote shell exited '
-                .'before the stage script finished, most likely because a service restart dropped the session.'
-            );
-        }
-
-        if ($status !== '0') {
-            throw new ProvisioningException('Cloud image stage failed: '.$stageId.' (exit code '.$status.').');
-        }
-    }
-
-    /** @param array<string, mixed> $stage */
-    private function uploadStageFiles(SshConnection $ssh, TemplateCatalogEntry $entry, string $templateDirectory, array $stage): void
-    {
-        $runnerRoot = $this->runnerImages->filesystemRoot($entry);
-
-        foreach ($stage['uploads'] ?? [] as $upload) {
-            if (! is_array($upload)) {
-                continue;
-            }
-
-            $source = $upload['source'] ?? null;
-            $destination = $upload['destination'] ?? null;
-
-            if (! is_string($source) || ! is_string($destination) || $source === '' || $destination === '' || str_contains($source, '..')) {
-                throw new ProvisioningException('Cloud image manifest contains an invalid upload path.');
-            }
-
-            $root = ($upload['source_root'] ?? 'runner_images') === 'catalog_root'
-                ? $this->catalog->root()
-                : (($upload['source_root'] ?? 'runner_images') === 'template' ? $templateDirectory : $runnerRoot);
-
-            if ($root === null) {
-                throw new ProvisioningException('The cloud image manifest requires runner-images files, but no scripts root is available.');
-            }
-
-            $localPath = rtrim($root, '/').'/'.ltrim($source, '/');
-            $sourceIsDirectory = is_dir($localPath);
-            $files = $sourceIsDirectory ? $this->filesIn($localPath) : [$localPath];
-
-            if ($files === [] || ! is_readable($localPath)) {
-                throw new ProvisioningException('Cloud image upload source does not exist: '.$localPath);
-            }
-
-            $remoteRoot = $sourceIsDirectory ? $destination : dirname($destination);
-            $ssh->run('sudo mkdir -p '.escapeshellarg($remoteRoot).' && sudo chmod 0777 '.escapeshellarg($remoteRoot));
-
-            foreach ($files as $file) {
-                $relative = $sourceIsDirectory ? ltrim(substr($file, strlen(rtrim($localPath, '/'))), '/') : basename($destination);
-                $remote = $sourceIsDirectory ? rtrim($destination, '/').'/'.$relative : $destination;
-                $ssh->run('mkdir -p '.escapeshellarg(dirname($remote)));
-                $ssh->putFile($remote, $file);
-                $mode = (int) ($upload['mode'] ?? 0644);
-                $ssh->chmod($mode, $remote);
-            }
-        }
-    }
-
-    /** @return list<string> */
-    private function filesIn(string $directory): array
-    {
-        $files = [];
-        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
-
-        foreach ($iterator as $file) {
-            if ($file->isFile()) {
-                $files[] = $file->getPathname();
-            }
-        }
-
-        sort($files);
-
-        return $files;
-    }
-
-    /**
-     * Resolves a stage's declared `environment` map to real values, applied once per stage (see
-     * `runManifestCommands()`) rather than repeated on every command. A reference matching one of
-     * the dynamic per-build values below is substituted; anything else is used as a literal
-     * (e.g. static paths/flags that are safe to keep in the public manifest as-is).
-     *
-     * @param  array<string, mixed>  $declared
-     */
+    /** @param array<string, mixed> $declared */
     private function stageEnvironment(ImageBuild $build, array $declared): array
     {
         $account = $build->environment?->githubAccount;
@@ -551,13 +350,4 @@ final class CloudImageBuilder implements BuilderInterface
         return $resolved;
     }
 
-    /** @param array<string, string> $environment */
-    private function exportEnvironment(array $environment): string
-    {
-        return implode(' ', array_map(
-            fn (string $name, string $value): string => $name.'='.escapeshellarg($value),
-            array_keys($environment),
-            $environment,
-        ));
-    }
 }
