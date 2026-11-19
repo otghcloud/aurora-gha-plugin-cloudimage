@@ -93,7 +93,15 @@ final class CloudImageGuestBuildReconciler
 
     public function claimFinalization(ImageBuild $build): bool
     {
-        $staleBefore = now()->subSeconds(self::FINALIZATION_LEASE_SECONDS);
+        $target = $build->proxmoxTarget;
+        // Include both tasks, submission/poll HTTP requests, authentication and polling slack.
+        $lease = max(
+            self::FINALIZATION_LEASE_SECONDS,
+            2 * ($target?->proxmox_task_timeout ?? 3600)
+            + 5 * ($target?->proxmox_api_timeout ?? 120)
+            + 30,
+        );
+        $staleBefore = now()->subSeconds($lease);
 
         return ImageBuild::query()
             ->whereKey($build->id)
@@ -131,7 +139,7 @@ final class CloudImageGuestBuildReconciler
             port: 22,
             username: $credential->resolvedUsername(),
             privateKey: $credential->private_key,
-            timeout: 30,
+            timeout: $build->proxmoxTarget->cloudimage_ssh_timeout ?? 600,
         );
         $directory = GuestBuildPath::forBuild($build, $credential);
 

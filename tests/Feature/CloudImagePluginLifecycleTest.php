@@ -9,6 +9,7 @@ require_once dirname(__DIR__, 2).'/src/CloudImageGuestBuildReconciler.php';
 require_once dirname(__DIR__, 2).'/src/CloudImageBuildCancellation.php';
 
 use App\Enums\BuildStatus;
+use App\Exceptions\ProvisioningException;
 use App\Models\Builds\ImageBuild;
 use App\Models\Credentials\BuildCredential;
 use App\Models\GitHub\GitHubAccount;
@@ -21,6 +22,7 @@ use App\Services\Builds\RunnerImagesLocator;
 use App\Services\Builds\TemplateCatalog;
 use App\Services\Builds\TemplateCatalogEntry;
 use App\Services\Builds\TemplateRebuilder;
+use App\Services\Proxmox\ProxmoxClient;
 use App\Services\SettingsRepository;
 use App\Services\Ssh\SshConnection;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -49,6 +51,8 @@ final class CloudImageTestSshConnection
 
     public static int $disconnects = 0;
 
+    public static array $timeouts = [];
+
     public function __construct(
         public readonly string $host,
         public readonly int $port,
@@ -57,7 +61,9 @@ final class CloudImageTestSshConnection
         public readonly ?string $privateKey = null,
         public readonly ?string $passphrase = null,
         public readonly int $timeout = 300,
-    ) {}
+    ) {
+        self::$timeouts[] = $timeout;
+    }
 
     public function putFile(string $remotePath, string $localPath): self
     {
@@ -100,6 +106,7 @@ class CloudImagePluginLifecycleTest extends TestCase
         CloudImageTestSshConnection::$uploadedFiles = [];
         CloudImageTestSshConnection::$commands = [];
         CloudImageTestSshConnection::$disconnects = 0;
+        CloudImageTestSshConnection::$timeouts = [];
 
         parent::setUp();
 
@@ -212,6 +219,7 @@ class CloudImagePluginLifecycleTest extends TestCase
     #[PreserveGlobalState(false)]
     public function test_guest_bootstrap_is_detached_and_removes_the_uploaded_bundle(): void
     {
+        $this->build->proxmoxTarget->update(['cloudimage_ssh_timeout' => 123]);
         [$entry, $templateDirectory, $runnerRoot, $catalogRoot] = $this->bundleFixture();
         app(SettingsRepository::class)->set(SettingsRepository::BUILD_API_URL, 'https://manager.example.test');
         $images = Mockery::mock(RunnerImagesLocator::class);
@@ -248,12 +256,14 @@ class CloudImagePluginLifecycleTest extends TestCase
         $this->assertStringContainsString('</dev/null >/dev/null 2>&1 &', CloudImageTestSshConnection::$commands[0]);
         $this->assertStringContainsString('rm -rf', CloudImageTestSshConnection::$commands[2]);
         $this->assertSame(1, CloudImageTestSshConnection::$disconnects);
+        $this->assertSame([123], CloudImageTestSshConnection::$timeouts);
     }
 
     #[RunInSeparateProcess]
     #[PreserveGlobalState(false)]
     public function test_restart_recovery_reads_result_file_and_finalizes_the_guest_vm(): void
     {
+        $this->build->proxmoxTarget->update(['cloudimage_ssh_timeout' => 234]);
         $this->attachBuildCredential();
         $this->fakeProxmox(resultFromGuest: true);
         CloudImageTestSshConnection::$responses = ['{"outcome":"succeeded","exit_code":0}'];
@@ -265,10 +275,59 @@ class CloudImagePluginLifecycleTest extends TestCase
         $this->assertSame('succeeded', $this->build->fresh()->guest_outcome);
         $this->assertStringContainsString('result.json', CloudImageTestSshConnection::$commands[0]);
         $this->assertSame(1, CloudImageTestSshConnection::$disconnects);
+        $this->assertSame([234], CloudImageTestSshConnection::$timeouts);
         Http::assertSent(fn (Request $request): bool => $request->method() === 'POST'
             && str_ends_with($request->url(), '/qemu/9000/status/shutdown'));
         Http::assertSent(fn (Request $request): bool => $request->method() === 'POST'
             && str_ends_with($request->url(), '/qemu/9000/template'));
+    }
+
+    public function test_guest_ip_wait_respects_the_supplied_node_timeout(): void
+    {
+        $proxmox = Mockery::mock(ProxmoxClient::class);
+        $proxmox->shouldReceive('guestIpv4')->with(9000)->andReturn(null, '192.0.2.10');
+
+        $this->expectException(ProvisioningException::class);
+        $this->expectExceptionMessage('never reported an IPv4 address');
+
+        (new ReflectionMethod(CloudImageBuilder::class, 'awaitGuestIp'))->invoke(
+            new CloudImageBuilder, $proxmox, 9000, 1,
+        );
+    }
+
+    public function test_guest_build_wait_respects_the_node_timeout(): void
+    {
+        $this->build->proxmoxTarget->update(['cloudimage_build_timeout' => 1]);
+        $build = Mockery::mock(ImageBuild::class)->makePartial();
+        $build->shouldReceive('getCasts')->andReturn($this->build->getCasts());
+        $build->setRawAttributes($this->build->getAttributes(), true);
+        $build->setRelation('proxmoxTarget', $this->build->proxmoxTarget);
+        $build->shouldReceive('refresh')->once()->andReturn($build);
+        $build->shouldReceive('refresh')->zeroOrMoreTimes()->andReturnUsing(function () use ($build): ImageBuild {
+            $build->status = BuildStatus::Succeeded;
+
+            return $build;
+        });
+        $ssh = Mockery::mock(SshConnection::class);
+        $ssh->shouldReceive('run')->once()->andReturn('');
+
+        $this->expectException(ProvisioningException::class);
+        $this->expectExceptionMessage('Timed out waiting for the Cloud Image guest build result.');
+
+        (new ReflectionMethod(CloudImageBuilder::class, 'awaitGuestResult'))->invoke(
+            new CloudImageBuilder, $build, $ssh, '/unused',
+        );
+    }
+
+    public function test_long_node_task_waits_prevent_premature_finalization_takeover(): void
+    {
+        $this->build->proxmoxTarget->update(['proxmox_task_timeout' => 7200]);
+        $this->build->update(['guest_finalizing_at' => now()->subMinutes(16)]);
+
+        $this->assertFalse($this->reconciler()->claimFinalization($this->build));
+
+        $this->build->update(['guest_finalizing_at' => now()->subHours(6)]);
+        $this->assertTrue($this->reconciler()->claimFinalization($this->build));
     }
 
     public function test_reconciled_guest_failure_destroys_the_vm_and_finalizes_failed(): void

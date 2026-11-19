@@ -21,10 +21,6 @@ use Illuminate\Support\Facades\Log;
 
 final class CloudImageBuilder implements BuilderInterface
 {
-    private const GUEST_IP_TIMEOUT_SECONDS = 300;
-
-    private const GUEST_BUILD_TIMEOUT_SECONDS = 43200;
-
     private const GUEST_POLL_SECONDS = 2;
 
     public function __construct(
@@ -100,7 +96,7 @@ final class CloudImageBuilder implements BuilderInterface
             );
             $proxmox->start($vmid);
 
-            $ip = $this->awaitGuestIp($proxmox, $vmid);
+            $ip = $this->awaitGuestIp($proxmox, $vmid, $target->cloudimage_guest_ip_timeout ?? 600);
             if (! $this->runGuestBundle($build, $entry, $templateDirectory, $ip, $credential)) {
                 return new BuildResult(true, 0, $vmid);
             }
@@ -136,9 +132,9 @@ final class CloudImageBuilder implements BuilderInterface
         }
     }
 
-    private function awaitGuestIp(ProxmoxClient $proxmox, int $vmid): string
+    private function awaitGuestIp(ProxmoxClient $proxmox, int $vmid, int $timeout): string
     {
-        $deadline = microtime(true) + self::GUEST_IP_TIMEOUT_SECONDS;
+        $deadline = microtime(true) + $timeout;
 
         while (microtime(true) < $deadline) {
             $ip = $proxmox->guestIpv4($vmid);
@@ -181,7 +177,7 @@ final class CloudImageBuilder implements BuilderInterface
             port: 22,
             username: (string) $credential->resolvedUsername(),
             privateKey: $credential->private_key,
-            timeout: 300,
+            timeout: $build->proxmoxTarget?->cloudimage_ssh_timeout ?? 600,
         );
 
         try {
@@ -247,7 +243,7 @@ final class CloudImageBuilder implements BuilderInterface
     /** Returns whether this worker owns finalization, rather than a reconciler having completed it. */
     private function awaitGuestResult(ImageBuild $build, SshConnection $ssh, string $remoteDirectory): bool
     {
-        $deadline = microtime(true) + self::GUEST_BUILD_TIMEOUT_SECONDS;
+        $deadline = microtime(true) + ($build->proxmoxTarget?->cloudimage_build_timeout ?? 43200);
         $logOffset = 0;
 
         while (microtime(true) < $deadline) {
@@ -349,5 +345,4 @@ final class CloudImageBuilder implements BuilderInterface
 
         return $resolved;
     }
-
 }
